@@ -172,6 +172,21 @@ static gid_t mygetgid(lua_State *L, int i)
 }
 
 
+static FILE** my_checkfile(lua_State *L, int index)
+{
+	FILE **f = (FILE **)luaL_checkudata(L, index, LUA_FILEHANDLE);
+	if (f == NULL)
+	{
+		return (FILE**)luaL_typerror(L, index, "file");
+	}
+	if (*f == NULL)
+	{
+		return (FILE**)luaL_argerror(L, index, "file is closed");
+	}
+	return f;
+}
+
+
 static int Perrno(lua_State *L)			/** errno([n]) */
 {
 	int n = luaL_optint(L, 1, errno);
@@ -290,6 +305,14 @@ static int Pfiles(lua_State *L)			/** files([path]) */
 }
 
 
+static int Pfsync(lua_State *L)			/** fsync([fd]) */
+{
+	FILE **f = my_checkfile(L, 1);
+	fflush(*f);
+	return pushresult(L, fsync(fileno(*f)), NULL);
+}
+
+
 static int Pgetcwd(lua_State *L)		/** getcwd() */
 {
 	char b[PATH_MAX];
@@ -364,30 +387,40 @@ static int Paccess(lua_State *L)		/** access(path,[mode]) */
 }
 
 
-static int myfclose (lua_State *L) {
-  FILE **p = (FILE **)lua_touserdata(L, 1);
-  int rc = fclose(*p);
-  if (rc == 0) *p = NULL;
-  return pushresult(L, rc, NULL);
+static int myfclose (lua_State *L)
+{
+	FILE **p = (FILE **)lua_touserdata(L, 1);
+	int rc = 0;
+	if( p && *p )
+	{
+		rc = fclose(*p);
+		if (rc == 0) *p = NULL;
+	}
+	return pushresult(L, rc, NULL);
 } 
 
-static int pushfile (lua_State *L, int id, const char *mode) {
-  FILE **f = (FILE **)lua_newuserdata(L, sizeof(FILE *));
-  *f = NULL;
-  luaL_getmetatable(L, LUA_FILEHANDLE);
-  lua_setmetatable(L, -2);
-  lua_getfield(L, LUA_REGISTRYINDEX, "POSIX_PIPEFILE");
-  if (lua_isnil(L, -1)) {
-    lua_pop(L, 1);
-    lua_newtable(L);
-    lua_pushvalue(L, -1);
-    lua_pushcfunction(L, myfclose);
-    lua_setfield(L, -2, "__close");
-    lua_setfield(L, LUA_REGISTRYINDEX, "POSIX_PIPEFILE");
-  }
-  lua_setfenv(L, -2);
-  *f = fdopen(id, mode);
-  return (*f != NULL);
+static FILE** pushfile(lua_State *L, int id, const char *mode)
+{
+	FILE **f = (FILE **)lua_newuserdata(L, sizeof(FILE *));
+	*f = NULL;
+
+	luaL_getmetatable(L, LUA_FILEHANDLE);
+	lua_setmetatable(L, -2);
+
+	lua_getfield(L, LUA_REGISTRYINDEX, "POSIX_PIPEFILE");
+	if (lua_isnil(L, -1))
+	{
+		lua_pop(L, 1);
+		lua_newtable(L);
+		lua_pushvalue(L, -1);
+		lua_pushcfunction(L, myfclose);
+		lua_setfield(L, -2, "__close");
+		lua_setfield(L, LUA_REGISTRYINDEX, "POSIX_PIPEFILE");
+	}
+	lua_setfenv(L, -2);
+
+	*f = fdopen(id, mode);
+	return f;
 }
 
 static int Ppipe(lua_State *L)			/** pipe() */
@@ -402,8 +435,8 @@ static int Ppipe(lua_State *L)			/** pipe() */
 
 static int Pfileno(lua_State *L)	/** fileno(filehandle) */
 {
-	FILE *f = *(FILE**) luaL_checkudata(L, 1, LUA_FILEHANDLE);
-	return pushresult(L, fileno(f), NULL);
+	FILE **f = my_checkfile(L, 1);
+	return pushresult(L, fileno(*f), NULL);
 }
 
 
@@ -420,35 +453,77 @@ static int Pfdopen(lua_State *L)	/** fdopen(fd, mode) */
 /* helper func for Pdup */
 static const char *filemode(int fd)
 {
-	const char *m;
+	const char* m = NULL;
 	int mode = fcntl(fd, F_GETFL);
+
 	if (mode < 0)
 		return NULL;
-	switch (mode & O_ACCMODE) {
-		case O_RDONLY:  m = "r"; break;
-		case O_WRONLY:  m = "w"; break;
-		default:    	m = "rw"; break;
+
+	switch (mode & O_ACCMODE)
+	{
+	case O_RDONLY:
+		m = "r";
+		break;
+	case O_WRONLY:
+		if (mode & O_APPEND)
+			m = "a";
+		else
+			m = "w";
+		break;
+	default:
+		if (mode & O_APPEND)
+			m = "a+";
+		else
+			m = "rw";
+		break;
 	}
+
 	return m;
 }
 
 static int Pdup(lua_State *L)			/** dup(old,[new]) */
 {
-	FILE **oldf = (FILE**)luaL_checkudata(L, 1, LUA_FILEHANDLE);
-  	FILE **newf = (FILE **)lua_touserdata(L, 2);
-	int fd;
-	const char *msg = "dup2";
-	fflush(*newf);
-	if (newf == NULL) {
-		fd = dup(fileno(*oldf));
-		msg = "dup";
-	} else {
-		fflush(*newf);
-		fd = dup2(fileno(*oldf), fileno(*newf));
+	FILE **oldf = my_checkfile(L, 1);
+  	FILE **newf = NULL;
+	fpos_t pos;
+	int fd = -1;
+	
+	if (lua_touserdata(L, 2))
+	{
+		newf = my_checkfile(L, 2);
 	}
 
-	if ((fd < 0) || !pushfile(L, fd, filemode(fd)))
-		return pusherror(L, msg);
+	if (newf == NULL)
+	{
+		fd = dup(fileno(*oldf));
+	
+		if (fd < 0)
+		{
+			pusherror(L, "dup");
+		}
+
+		newf = pushfile(L, fd, filemode(fd));
+	}
+	else
+	{
+		fflush(*newf);
+		fd = dup2(fileno(*oldf), fileno(*newf));
+
+		if (fd < 0)
+		{
+			pusherror(L, "dup2");
+		}
+
+		*newf = fdopen(fd, filemode(fd));
+		lua_pushvalue(L, 2);
+	}
+
+	if( fgetpos(*oldf, &pos) < 0 )
+	{
+		memset(&pos, 1, sizeof(pos));
+	}
+	fsetpos(*newf, &pos);
+
 	return 1;
 }
 
@@ -498,9 +573,9 @@ static int Pfork(lua_State *L)			/** fork() */
 static int Ppoll(lua_State *L)   /** poll(filehandle, timeout) */
 {
 	struct pollfd fds;
-	FILE* file = *(FILE**)luaL_checkudata(L,1,LUA_FILEHANDLE);
+	FILE** file = my_checkfile(L, 1);
 	int timeout = luaL_checkint(L,2);
-	fds.fd = fileno(file);
+	fds.fd = fileno(*file);
 	fds.events = POLLIN;
 	return pushresult(L, poll(&fds,1,timeout), NULL);
 }
@@ -892,6 +967,13 @@ static int Pstat(lua_State *L)			/** stat(path,[options]) */
 }
 
 
+static int Psync(lua_State *L)			/** sync() */
+{
+	sync();
+	return 0;
+}
+
+
 static int Puname(lua_State *L)			/** uname([string]) */
 {
 	struct utsname u;
@@ -1142,6 +1224,7 @@ static const luaL_reg R[] =
 	{"fdopen",		Pfdopen},
 	{"fileno",		Pfileno},
 	{"files",		Pfiles},
+	{"fsync",		Pfsync},
 	{"fork",		Pfork},
 	{"getcwd",		Pgetcwd},
 	{"getenv",		Pgetenv},
@@ -1166,6 +1249,7 @@ static const luaL_reg R[] =
 	{"setrlimit",		Psetrlimit},
 	{"sleep",		Psleep},
 	{"stat",		Pstat},
+	{"sync",		Psync},
 	{"sysconf",		Psysconf},
 	{"times",		Ptimes},
 	{"ttyname",		Pttyname},
