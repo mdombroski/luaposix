@@ -465,16 +465,10 @@ static const char *filemode(int fd)
 		m = "r";
 		break;
 	case O_WRONLY:
-		if (mode & O_APPEND)
-			m = "a";
-		else
-			m = "w";
+		m = (mode & O_APPEND)?"a":"w";
 		break;
 	default:
-		if (mode & O_APPEND)
-			m = "a+";
-		else
-			m = "rw";
+		m = (mode & O_APPEND)?"a+":"w+";
 		break;
 	}
 
